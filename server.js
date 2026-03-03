@@ -22,14 +22,23 @@ const OTP_EXPIRY_MS  = 5 * 60 * 1000;  // 5 minutes
 const OTP_LENGTH     = 6;
 
 // ── Brevo SMTP transporter ──
+// BREVO_SMTP_USER = your full Brevo account login email (e.g. you@gmail.com)
+// BREVO_SMTP_KEY  = the SMTP key from Brevo dashboard (SMTP & API → SMTP tab)
 const transporter = nodemailer.createTransport({
   host:   'smtp-relay.brevo.com',
   port:   587,
   secure: false,
   auth: {
-    user: process.env.BREVO_SMTP_USER,   // your Brevo login email
-    pass: process.env.BREVO_SMTP_KEY,    // your Brevo SMTP key (not account password)
+    user: process.env.BREVO_SMTP_USER,
+    pass: process.env.BREVO_SMTP_KEY,
   },
+  tls: { rejectUnauthorized: false },
+});
+
+// Verify SMTP connection on startup
+transporter.verify((err, success) => {
+  if (err) console.error('SMTP connection FAILED:', err.message);
+  else     console.log('SMTP connection OK — ready to send emails');
 });
 
 // ── Middleware ──
