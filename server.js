@@ -1,50 +1,32 @@
 /**
  * Zync OTP Server — Deploy on Render
- * Sends login OTP emails via Brevo (Sendinblue) SMTP/API
+ * Sends login OTP emails via Brevo Transactional Email HTTP API
  * Routes:
  *   POST /send-otp   { email }         → generates & emails a 6-digit OTP
  *   POST /verify-otp { email, otp }    → verifies the OTP, returns { valid: true/false }
+ *
+ * Required env vars on Render:
+ *   BREVO_API_KEY      — your Brevo API key (starts with xkeysib-)
+ *   BREVO_SENDER_EMAIL — verified sender email in your Brevo account
+ *   ALLOWED_ORIGIN     — your hosted domain, or * for dev (optional)
  */
 
-const express  = require('express');
-const cors     = require('cors');
-const crypto   = require('crypto');
-const nodemailer = require('nodemailer');
+const express = require('express');
+const cors    = require('cors');
+const crypto  = require('crypto');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── In-memory OTP store: { email → { otp, expiresAt } } ──
-// For production with multiple instances use Redis instead.
 const otpStore = new Map();
 
-const OTP_EXPIRY_MS  = 5 * 60 * 1000;  // 5 minutes
-const OTP_LENGTH     = 6;
-
-// ── Brevo SMTP transporter ──
-// BREVO_SMTP_USER = your full Brevo account login email (e.g. you@gmail.com)
-// BREVO_SMTP_KEY  = the SMTP key from Brevo dashboard (SMTP & API → SMTP tab)
-const transporter = nodemailer.createTransport({
-  host:   'smtp-relay.brevo.com',
-  port:   587,
-  secure: false,
-  auth: {
-    user: process.env.BREVO_SMTP_USER,
-    pass: process.env.BREVO_SMTP_KEY,
-  },
-  tls: { rejectUnauthorized: false },
-});
-
-// Verify SMTP connection on startup
-transporter.verify((err, success) => {
-  if (err) console.error('SMTP connection FAILED:', err.message);
-  else     console.log('SMTP connection OK — ready to send emails');
-});
+const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── Middleware ──
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',  // set to your hosted domain e.g. https://zync.app
-  methods: ['POST'],
+  origin:  process.env.ALLOWED_ORIGIN || '*',
+  methods: ['POST', 'GET'],
 }));
 app.use(express.json());
 
@@ -62,38 +44,29 @@ function storeOTP(email, otp) {
 
 function verifyOTP(email, otp) {
   const record = otpStore.get(email.toLowerCase());
-  if (!record) return { valid: false, reason: 'No OTP found. Please request a new one.' };
+  if (!record)                   return { valid: false, reason: 'No OTP found. Please request a new one.' };
   if (Date.now() > record.expiresAt) {
     otpStore.delete(email.toLowerCase());
     return { valid: false, reason: 'OTP expired. Please request a new one.' };
   }
-  if (record.otp !== otp.trim()) {
-    return { valid: false, reason: 'Incorrect OTP. Please try again.' };
-  }
+  if (record.otp !== otp.trim()) return { valid: false, reason: 'Incorrect OTP. Please try again.' };
   otpStore.delete(email.toLowerCase()); // one-time use
   return { valid: true };
 }
 
-// ── Routes ──
+// ── Send email via Brevo HTTP API ──
+async function sendEmailViaBrevo(toEmail, otp) {
+  const apiKey      = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
 
-// Health check
-app.get('/', (req, res) => res.json({ status: 'Zync OTP Server running ✓' }));
+  if (!apiKey)      throw new Error('BREVO_API_KEY env var is not set.');
+  if (!senderEmail) throw new Error('BREVO_SENDER_EMAIL env var is not set.');
 
-// POST /send-otp
-app.post('/send-otp', async (req, res) => {
-  const { email } = req.body;
-  if (!email || !email.includes('@')) {
-    return res.status(400).json({ success: false, message: 'Invalid email address.' });
-  }
-
-  const otp = generateOTP();
-  storeOTP(email, otp);
-
-  const mailOptions = {
-    from: `"Zync Authenticator" <${process.env.BREVO_SENDER_EMAIL}>`,
-    to: email,
+  const payload = {
+    sender:  { name: 'Zync Authenticator', email: senderEmail },
+    to:      [{ email: toEmail }],
     subject: `${otp} is your Zync login code`,
-    html: `
+    htmlContent: `
       <!DOCTYPE html>
       <html>
       <head>
@@ -142,15 +115,51 @@ app.post('/send-otp', async (req, res) => {
       </body>
       </html>
     `,
-    text: `Your Zync login code is: ${otp}\n\nThis code expires in 5 minutes.\n\nIf you didn't request this, please ignore this email.`,
+    textContent: `Your Zync login code is: ${otp}\n\nThis code expires in 5 minutes.\n\nIf you didn't request this, please ignore this email.`,
   };
 
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method:  'POST',
+    headers: {
+      'accept':       'application/json',
+      'api-key':      apiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    console.error('Brevo API error:', response.status, errBody);
+    throw new Error(`Brevo API error ${response.status}: ${errBody}`);
+  }
+
+  return await response.json();
+}
+
+// ── Routes ──
+
+// Health check
+app.get('/', (req, res) => res.json({ status: 'Zync OTP Server running ✓' }));
+
+// POST /send-otp
+app.post('/send-otp', async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.includes('@')) {
+    return res.status(400).json({ success: false, message: 'Invalid email address.' });
+  }
+
+  const otp = generateOTP();
+  storeOTP(email, otp);
+
   try {
-    await transporter.sendMail(mailOptions);
+    await sendEmailViaBrevo(email, otp);
     console.log(`OTP sent to ${email}`);
     res.json({ success: true, message: 'OTP sent successfully.' });
   } catch (err) {
-    console.error('Mail error:', err);
+    console.error('Mail error:', err.message);
+    // Remove stored OTP if send failed so user can retry cleanly
+    otpStore.delete(email.toLowerCase());
     res.status(500).json({ success: false, message: 'Failed to send OTP email. Please try again.' });
   }
 });
